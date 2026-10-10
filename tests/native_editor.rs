@@ -71,6 +71,23 @@ fn native_editing_unicode_split_selection_highlighting_and_undo() {
 
         let available = editor::available_lexers();
         let catalog = languages::catalog(&available);
+        let preview = Editor::new(parent, instance, 105, false).unwrap();
+        let markdown = catalog
+            .iter()
+            .find(|language| language.lexer == "markdown")
+            .unwrap();
+        preview.theme_with_font(markdown, Palette::new(true), &EditorFont::default());
+        preview.send_raw(SCI_SETILEXER, 0, 0);
+        let (rendered, styles) =
+            rstpd::markdown_preview::render("# Héllo\n\n**bold** and `code`").unwrap();
+        preview.set_read_only_text(&rendered).unwrap();
+        preview.highlight(&styles).unwrap();
+        assert_eq!(preview.send(SCI_GETREADONLY, 0, 0), 1);
+        assert_eq!(preview.send(SCI_GETSTYLEAT, 0, 0), 6);
+        assert_eq!(preview.text().unwrap(), rendered);
+        preview.send_raw(SCI_INSERTTEXT, 0, c"not allowed".as_ptr() as isize);
+        assert_eq!(preview.text().unwrap(), rendered);
+        assert_eq!(left.text().unwrap(), "one\ntwo\n");
         for language in &catalog {
             left.language(language, Palette::new(false)).unwrap();
             if language.uses_container() {

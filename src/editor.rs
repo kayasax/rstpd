@@ -320,6 +320,13 @@ impl Editor {
         );
         unsafe { self.send_raw(message, w, l) }
     }
+    pub fn copy_text(self, text: &str) -> Result<()> {
+        let text = CString::new(text).map_err(|_| "Clipboard text contains a NUL character.")?;
+        unsafe {
+            self.send_raw(SCI_COPYTEXT, text.as_bytes().len(), text.as_ptr() as isize);
+        }
+        Ok(())
+    }
     /// # Safety
     /// Pointer arguments must satisfy the selected Scintilla message's lifetime, size,
     /// ownership and mutability requirements. Only call on the control's UI thread.

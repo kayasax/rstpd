@@ -6,6 +6,72 @@ use std::time::{Duration, Instant};
 pub const MAX_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
 
 pub fn render(source: &str) -> Result<(String, Highlight)> {
+    let (text, highlight, _) = render_mapped(source)?;
+    Ok((text, highlight))
+}
+
+#[derive(Default)]
+pub struct SourceMap(Vec<(std::ops::Range<usize>, std::ops::Range<usize>, bool)>);
+
+impl SourceMap {
+    fn translate(&self, position: usize, reverse: bool) -> usize {
+        let mut nearest = (0, 0);
+        let mut containing = None;
+        for (source, rendered, exact) in &self.0 {
+            let (from, to) = if reverse {
+                (rendered, source)
+            } else {
+                (source, rendered)
+            };
+            if from.start <= position && from.start >= nearest.0 {
+                nearest = (from.start, to.start);
+            }
+            if from.contains(&position) {
+                let value = to.start + if *exact { position - from.start } else { 0 };
+                if containing.is_none_or(|(size, _)| from.len() < size) {
+                    containing = Some((from.len(), value));
+                }
+            }
+        }
+        containing.map_or(nearest.1, |(_, value)| value)
+    }
+    pub fn source(&self, rendered: usize) -> usize {
+        self.translate(rendered, true)
+    }
+    pub fn rendered(&self, source: usize) -> usize {
+        self.translate(source, false)
+    }
+}
+
+/// Right affinity keeps an existing anchor attached to text inserted before it.
+pub fn rebase(old: &str, new: &str, position: usize) -> usize {
+    if old == new {
+        return position.min(new.len());
+    }
+    let diff = similar::TextDiff::configure()
+        .timeout(Duration::from_millis(20))
+        .diff_chars(old, new);
+    let (mut before, mut after) = (0, 0);
+    for change in diff.iter_all_changes() {
+        let len = change.value().len();
+        match change.tag() {
+            similar::ChangeTag::Insert => after += len,
+            similar::ChangeTag::Delete => {
+                before += len;
+            }
+            similar::ChangeTag::Equal => {
+                if position < before + len {
+                    return after + position.saturating_sub(before);
+                }
+                before += len;
+                after += len;
+            }
+        }
+    }
+    after
+}
+
+pub fn render_mapped(source: &str) -> Result<(String, Highlight, SourceMap)> {
     if source.len() > MAX_PREVIEW_BYTES {
         return Err("Markdown preview is limited to 2 MiB. The source remains editable.".into());
     }
@@ -17,6 +83,7 @@ pub fn render(source: &str) -> Result<(String, Highlight)> {
     let mut strikes = Vec::new();
     let mut strike_start = Vec::new();
     let mut links = Vec::new();
+    let mut mapping = SourceMap::default();
     fn append(text: &mut String, styles: &mut Vec<u8>, value: &str, style: u8) {
         text.push_str(value);
         styles.resize(text.len(), style);
@@ -28,8 +95,21 @@ pub fn render(source: &str) -> Result<(String, Highlight)> {
             | Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_FOOTNOTES,
     )
+    .into_offset_iter()
     .enumerate()
     {
+        let (event, range) = event;
+        let start = text.len();
+        let literal = matches!(
+            event,
+            Event::Text(_)
+                | Event::Code(_)
+                | Event::Html(_)
+                | Event::InlineHtml(_)
+                | Event::InlineMath(_)
+                | Event::DisplayMath(_)
+        );
+        let ending = matches!(event, Event::End(_));
         if i % 1024 == 0 && Instant::now() > deadline {
             return Err("Markdown preview exceeded its time budget.".into());
         }
@@ -146,6 +226,24 @@ pub fn render(source: &str) -> Result<(String, Highlight)> {
                 append(&mut text, &mut styles, &value, 19)
             }
         }
+        if text.len() > start {
+            let output = &text[start..];
+            let literal_range = literal
+                .then(|| source[range.clone()].find(output))
+                .flatten()
+                .map(|offset| range.start + offset..range.start + offset + output.len());
+            let exact = literal_range.is_some();
+            let range = literal_range.unwrap_or_else(|| {
+                if literal {
+                    range.clone()
+                } else if ending {
+                    range.end..range.end
+                } else {
+                    range.start..range.start
+                }
+            });
+            mapping.0.push((range, start..text.len(), exact));
+        }
         if text.len() > MAX_PREVIEW_BYTES * 4 {
             return Err("Rendered Markdown exceeds the preview size limit.".into());
         }
@@ -157,12 +255,51 @@ pub fn render(source: &str) -> Result<(String, Highlight)> {
             folds: Vec::new(),
             strikes,
         },
+        mapping,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn viewport_anchor_follows_edits_before_it() {
+        let old = "# Heading\n\n- first\n- Héllo **visible**\n\nlast";
+        let (text, _, map) = render_mapped(old).unwrap();
+        let anchor = map.source(text.find("visible").unwrap());
+        for new in [
+            format!("## Added\n\n{old}"),
+            old.replace("- first\n", ""),
+            old.replace("Héllo", "Much longer 🦀 greeting"),
+            old.replace("# Heading", "# H")
+                .replace("last", "a longer last paragraph"),
+        ] {
+            let (text, _, map) = render_mapped(&new).unwrap();
+            assert_eq!(
+                map.rendered(rebase(old, &new, anchor)),
+                text.find("visible").unwrap()
+            );
+        }
+    }
+    #[test]
+    fn deleted_anchor_clamps_to_surviving_text() {
+        assert_eq!(rebase("before visible after", "before after", 10), 7);
+        assert_eq!(rebase("abc", "Xabc", 0), 1);
+        assert_eq!(rebase("abc", "", 2), 0);
+    }
+    #[test]
+    fn mappings_preserve_utf8_and_inline_offsets() {
+        let source = "# Title\n\n- Héllo **world** &amp; `code`\n\nlast";
+        let (text, _, map) = render_mapped(source).unwrap();
+        for value in ["Héllo", "world", "code", "last"] {
+            let rendered = text.find(value).unwrap();
+            let original = source.find(value).unwrap();
+            assert_eq!(map.source(rendered), original);
+            assert_eq!(map.rendered(original), rendered);
+        }
+        let offset = source.find("world").unwrap() + 3;
+        assert_eq!(map.source(map.rendered(offset)), offset);
+    }
     #[test]
     fn renders_structures_and_utf8_styles() {
         let (text, highlight) = render("# Héllo\n\n**bold** *italic* ~~gone~~ `code`\n\n- [x] task\n- item\n\n[link](https://example.org)\n\n```rust\nlet x = 1;\n```\n").unwrap();

@@ -71,6 +71,12 @@ the new settings.
 Each split pane owns its tab bar and independent selection.
 
 Markdown preview opens to the right of the source and refreshes automatically.
+Refresh keeps the visible content anchored to its Markdown source, including
+insertions and deletions above it and wrapped preview lines. Each open document
+remembers its preview position; a first preview starts at the source viewport.
+Manual preview scrolling is respected, without moving the source caret or
+forcing continuous scroll synchronization. Generated markers and decoded
+entities anchor to their source construct when there is no exact text match.
 Enable it from View or the clicked tab's right-click menu. The toggle and draggable
 divider position belong to that document, including its cloned views. Other tabs
 retain their normal editor and existing split layout; returning restores preview.

@@ -493,6 +493,20 @@ impl Editor {
         self.send(SCI_SETREADONLY, 1, 0);
         result
     }
+    pub fn viewport_position(self) -> usize {
+        self.send(SCI_POSITIONFROMPOINT, 0, 0).max(0) as usize
+    }
+    pub fn restore_viewport_position(self, position: usize) {
+        let position = position.min(self.length());
+        let line = self.send(SCI_LINEFROMPOSITION, position, 0).max(0) as usize;
+        // EnsureLineVisible completes pending wrapping before coordinate queries.
+        self.send(SCI_ENSUREVISIBLE, line, 0);
+        let start = self.send(SCI_POSITIONFROMLINE, line, 0);
+        let y = self.send(SCI_POINTYFROMPOSITION, 0, position as isize);
+        let top = self.send(SCI_POINTYFROMPOSITION, 0, start);
+        let height = self.send(SCI_TEXTHEIGHT, line, 0).max(1);
+        self.send(SCI_SCROLLVERTICAL, line, (y - top).max(0) / height);
+    }
     pub fn text(self) -> Result<String> {
         let len = self.length();
         let mut bytes = vec![0u8; len + 1];

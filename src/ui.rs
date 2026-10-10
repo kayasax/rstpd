@@ -1882,6 +1882,9 @@ struct App {
     map: Editor,
     preview: Editor,
     preview_key: Option<(u64, u64)>,
+    preview_document: Option<u64>,
+    preview_views:
+        std::collections::HashMap<u64, (String, crate::markdown_preview::SourceMap, usize)>,
     tabs: HWND,
     right_tabs: HWND,
     groups: [Vec<u64>; 2],
@@ -5654,8 +5657,13 @@ impl App {
         if self.preview_key == Some(key) {
             return Ok(());
         }
-        let first_line = self.preview.send(SCI_GETFIRSTVISIBLELINE, 0, 0);
-        let same_document = self.preview_key.is_some_and(|previous| previous.0 == key.0);
+        if let Some(previous) = self.preview_document {
+            if let Some((_, mapping, anchor)) = self.preview_views.get_mut(&previous) {
+                *anchor = mapping.source(self.preview.viewport_position());
+            }
+        }
+        self.preview_views
+            .retain(|id, _| self.documents.iter().any(|doc| doc.snapshot.id == *id));
         let language = self
             .languages
             .iter()
@@ -5689,24 +5697,34 @@ impl App {
                 (self.editor_font.size_hundredths() * percent / 100) as isize,
             );
         }
-        let rendered = if self.editor().length() > crate::markdown_preview::MAX_PREVIEW_BYTES {
+        let source = if self.editor().length() > crate::markdown_preview::MAX_PREVIEW_BYTES {
             Err("Markdown preview is limited to 2 MiB. The source remains editable.".into())
         } else {
-            crate::markdown_preview::render(&self.editor().text()?)
+            self.editor().text()
         };
+        let rendered = source
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|source| crate::markdown_preview::render_mapped(source));
         match rendered {
-            Ok((text, highlight)) => {
+            Ok((text, highlight, mapping)) => {
+                let source = source?;
+                let anchor = self.preview_views.get(&key.0).map_or_else(
+                    || self.editor().viewport_position(),
+                    |(old, _, anchor)| crate::markdown_preview::rebase(old, &source, *anchor),
+                );
                 self.preview.set_read_only_text(&text)?;
                 self.preview.highlight(&highlight)?;
+                self.preview
+                    .restore_viewport_position(mapping.rendered(anchor));
+                self.preview_views.insert(key.0, (source, mapping, anchor));
+                self.preview_document = Some(key.0);
             }
             Err(error) => {
                 self.preview.set_read_only_text(&error)?;
                 self.preview.clear_styles();
+                self.preview_document = None;
             }
-        }
-        if same_document {
-            self.preview
-                .send(SCI_SETFIRSTVISIBLELINE, first_line as usize, 0);
         }
         self.preview_key = Some(key);
         Ok(())
@@ -6344,6 +6362,8 @@ pub fn run() -> Result<()> {
             map,
             preview,
             preview_key: None,
+            preview_document: None,
+            preview_views: std::collections::HashMap::new(),
             tabs: null_mut(),
             right_tabs: null_mut(),
             groups: Default::default(),
